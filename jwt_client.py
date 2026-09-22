@@ -1,5 +1,5 @@
 # ============================================================
-# jwt_client.py - Free Fire login engine (curl_cffi impersonate)
+# jwt_client.py - Free Fire login engine (tls_client + JA3)
 # ============================================================
 import base64
 import json
@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from curl_cffi import requests as cffi_requests
+import tls_client
 import blackboxprotobuf
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -86,7 +86,15 @@ CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e
 UA_MSDK = "GarenaMSDK/4.0.44(ASUS_AI2501_B ;Android 12;en;US;app 2.132.1 2019118525;)"
 UA_UNITY = "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"
 
-IMPERSONATE = "chrome120"
+# Try different profiles
+CLIENT_PROFILE = "chrome_120"
+
+
+def _session():
+    return tls_client.Session(
+        client_identifier=CLIENT_PROFILE,
+        random_tls_extension_order=False,
+    )
 
 
 class FreeFireLogin:
@@ -135,15 +143,16 @@ class FreeFireLogin:
         }
         for attempt in range(4):
             try:
-                r = cffi_requests.post(
+                s = _session()
+                r = s.post(
                     f"{OAUTH_BASE}/api/v2/oauth/guest/token:grant",
                     headers={
                         "User-Agent": UA_MSDK,
                         "Content-Type": "application/json; charset=utf-8",
                         "Connection": "close",
                     },
-                    json=body, verify=False, proxies=self.proxy,
-                    timeout=self.timeout, impersonate=IMPERSONATE,
+                    json=body,
+                    timeout=25,
                 )
             except Exception as e:
                 if attempt == 3:
@@ -183,7 +192,8 @@ class FreeFireLogin:
 
         for attempt in range(3):
             try:
-                r = cffi_requests.post(
+                s = _session()
+                r = s.post(
                     f"{LOGIN_BASE}/MajorLogin",
                     headers={
                         "Host": "loginbp.ppmainecoonghj.com",
@@ -197,8 +207,8 @@ class FreeFireLogin:
                         "X-Unity-Version": "2018.4.12f1",
                         "X-GA-SV": str(int(time.time())),
                     },
-                    data=body, verify=False, proxies=self.proxy,
-                    timeout=self.timeout, impersonate=IMPERSONATE,
+                    data=body,
+                    timeout=25,
                 )
             except Exception as e:
                 if attempt == 2:
