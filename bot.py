@@ -1,8 +1,11 @@
 # ============================================================
-# bot.py - FF Like Bot v9 (all-in-one)
+# bot.py - FF Like Bot v12 (final, stable)
 # ============================================================
-# python-telegram-bot + Flask + Like engine
-# بنية نفس البوت القديم الذي كان يعمل
+# - python-telegram-bot 21.6
+# - curl_cffi (impersonate chrome120)
+# - Flask healthcheck
+# - Python 3.11 / 3.14 compatible
+# - all buttons work (allowed_updates = ALL_TYPES)
 # ============================================================
 
 import asyncio
@@ -10,18 +13,21 @@ import hashlib
 import json
 import logging
 import os
-import random
 import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-import requests
 import urllib3
 import blackboxprotobuf
+from curl_cffi import requests as cffi_requests
 from flask import Flask, jsonify
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -38,9 +44,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ============================================================
 # CONFIG
 # ============================================================
-BOT_TOKEN = os.environ.get(
-    "TG_TOKEN", "8776921304:AAE75XN-ZOXlBzbaikhxBOW9KQcPki2LREU"
-)
+BOT_TOKEN = os.environ.get("TG_TOKEN", "8776921304:AAE75XN-ZOXlBzbaikhxBOW9KQcPki2LREU")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7373420615"))
 ACCOUNTS_FILE = os.environ.get("ACCOUNTS_FILE", "accounts.json")
 TARGET_FILE = os.environ.get("TARGET_FILE", "target.json")
@@ -49,17 +53,15 @@ WORKERS = int(os.environ.get("LIKE_WORKERS", "5"))
 RESUME = os.environ.get("RESUME", "1") == "1"
 PROGRESS_EVERY_SEC = 6
 
-LIKE_URL = "https://clientbp.ggpolarbear.com/LikeProfile"
+LIKE_URL = "https://clientbp.ppmainecoonghj.com/LikeProfile"
 MAX_RETRIES = 3
 BASE_BACKOFF = 1.5
 MAX_BACKOFF = 20.0
 RATE_LIMIT_PER_MIN = 90
 CHECKPOINT_EVERY = 25
+IMPERSONATE = "chrome120"
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 log = logging.getLogger("ff_like")
 
 # ============================================================
@@ -70,11 +72,7 @@ active_chat_id = None
 current_target_uid = None
 live_progress_msg_id = None
 waiting_for_uid_input = False
-stats = {
-    "done": 0, "ok": 0, "fail": 0, "total": 0,
-    "start_time": 0.0,
-    "error_breakdown": {},
-}
+stats = {"done": 0, "ok": 0, "fail": 0, "total": 0, "start_time": 0.0, "error_breakdown": {}}
 STOP_FLAG = {"stop": False}
 LOG_LINES = []
 LOG_LOCK = threading.Lock()
@@ -87,12 +85,15 @@ def log_line(msg):
     print(line, flush=True)
     with LOG_LOCK:
         LOG_LINES.append(line)
-        if len(LOG_LINES) > 500:
-            del LOG_LINES[:200]
+        if len(LOG_LINES) > 800:
+            del LOG_LINES[:300]
 
 
 def is_admin(uid):
-    return int(uid) == ADMIN_ID
+    try:
+        return int(uid) == ADMIN_ID
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -152,7 +153,7 @@ def load_accounts(force=False):
 
 
 # ============================================================
-# RATE LIMITER
+# RATE LIMITER + GLOBAL BACKOFF
 # ============================================================
 class RateLimiter:
     def __init__(self, per_minute):
@@ -195,18 +196,6 @@ class GlobalBackoff:
 
 _global_backoff = GlobalBackoff()
 
-_tls = threading.local()
-
-
-def _session():
-    if not hasattr(_tls, "s"):
-        s = requests.Session()
-        s.verify = False
-        s.mount("http://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4))
-        s.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4))
-        _tls.s = s
-    return _tls.s
-
 
 # ============================================================
 # LIKE LOGIC
@@ -241,28 +230,27 @@ def like_once(engine, uid, password, target_uid, retries=MAX_RETRIES):
                 "Content-Type": "application/x-www-form-urlencoded",
                 "X-Unity-Version": "2018.4.12f1",
             }
-            r = _session().post(
-    LIKE_URL, headers=headers, data=body,
-    timeout=15, verify=False, proxies=None,
-)
+            r = cffi_requests.post(
+                LIKE_URL, headers=headers, data=body,
+                timeout=20, verify=False, impersonate=IMPERSONATE,
+            )
 
             if r.status_code == 429:
                 wait = min(BASE_BACKOFF * (2 ** attempt), MAX_BACKOFF)
                 _global_backoff.trigger(wait)
                 last_err = "429"
                 continue
+
             if r.status_code == 200:
                 return {"uid": uid, "account_id": acc_id, "success": True, "elapsed": time.time() - t0}
+
             last_err = f"HTTP {r.status_code}"
-        except requests.exceptions.Timeout:
-            last_err = "timeout"
-        except requests.exceptions.ConnectionError:
-            last_err = "conn_error"
         except Exception as e:
             last_err = str(e)[:80]
 
         if attempt < retries:
             time.sleep(min(BASE_BACKOFF * (2 ** attempt), MAX_BACKOFF))
+
     return {"uid": uid, "success": False, "error": last_err or "unknown", "elapsed": time.time() - t0}
 
 
@@ -274,7 +262,7 @@ def _load_ckpt(path):
     if not path or not os.path.exists(path):
         return set()
     try:
-        with open(path) as f:
+        with open(path, "r") as f:
             return set(json.load(f))
     except Exception:
         return set()
@@ -295,7 +283,6 @@ def run_like_batch(accounts, target_uid, workers, on_progress, stop_flag, resume
     ckpt = f"like_checkpoint_{target_uid}.json"
     failed_out = f"failed_accounts_{target_uid}.json"
 
-    # dedupe
     seen, uniq = set(), []
     for a in accounts:
         u = str(a.get("uid"))
@@ -365,9 +352,12 @@ def run_flask():
     @app.route("/")
     def index():
         return jsonify({
-            "status": "ok", "running": is_running,
+            "status": "ok",
+            "running": is_running,
             "target_uid": current_target_uid,
-            "done": stats["done"], "ok": stats["ok"], "fail": stats["fail"],
+            "done": stats["done"],
+            "ok": stats["ok"],
+            "fail": stats["fail"],
             "total": stats["total"],
         })
 
@@ -378,6 +368,11 @@ def run_flask():
     @app.route("/accounts-count")
     def accounts_count():
         return jsonify({"count": len(load_accounts())})
+
+    @app.route("/logs")
+    def get_logs():
+        with LOG_LOCK:
+            return jsonify({"lines": LOG_LINES[-200:]})
 
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
     app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
@@ -409,7 +404,7 @@ def kb_main():
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
-    
+
 
 def kb_back():
     return InlineKeyboardMarkup([
@@ -425,7 +420,7 @@ def main_text():
     tgt = current_target_uid or "لم يُعيَّن بعد"
     state = "🟢 يعمل" if is_running else "🔴 متوقف"
     return (
-        "❤️ *بوت إعجابات Free Fire — v9*\n"
+        "❤️ *بوت إعجابات Free Fire — v12*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🧠 الحالة: {state}\n"
         f"🎯 الهدف: `{tgt}`\n"
@@ -574,7 +569,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global waiting_for_uid_input, is_running, active_chat_id
 
     q = update.callback_query
-    await q.answer()
+    await q.answer()  # answer immediately to remove spinner
+
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
     active_chat_id = chat_id
@@ -738,13 +734,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# MAIN
+# MAIN — manual polling (Python 3.14 compatible)
 # ============================================================
-def main():
+async def main_async():
+    # Flask in background thread
     threading.Thread(target=run_flask, daemon=True).start()
     log_line(f"[main] Flask on {PORT}")
 
-    log_line("=== FF LIKE BOT v9 START ===")
+    log_line("=== FF LIKE BOT v12 START ===")
     log_line(f"admin={ADMIN_ID} workers={WORKERS} resume={RESUME}")
     log_line(f"accounts loaded: {len(load_accounts(force=True))}")
     log_line(f"target={current_target_uid or 'none'}")
@@ -755,10 +752,39 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    log_line("Bot polling...")
-    app.run_polling(drop_pending_updates=True)
+    # manual polling (avoids run_polling bug on Python 3.14)
+    log_line("Initializing bot...")
+    await app.initialize()
+    await app.start()
+
+    # IMPORTANT: allowed_updates must include callback_query
+    await app.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
+    log_line("Bot polling started (ALL_TYPES)")
+
+    # keep alive
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        try:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+        except Exception:
+            pass
+
+
+def main():
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        log_line("[main] stopped by user")
 
 
 if __name__ == "__main__":
     main()
-    

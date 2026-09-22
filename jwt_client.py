@@ -1,5 +1,5 @@
 # ============================================================
-# jwt_client.py - with curl_cffi TLS impersonation
+# jwt_client.py - Free Fire login engine (curl_cffi impersonate)
 # ============================================================
 import base64
 import json
@@ -86,12 +86,11 @@ CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e
 UA_MSDK = "GarenaMSDK/4.0.44(ASUS_AI2501_B ;Android 12;en;US;app 2.132.1 2019118525;)"
 UA_UNITY = "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"
 
-# impersonate profile - mimics a real browser's TLS fingerprint
 IMPERSONATE = "chrome120"
 
 
 class FreeFireLogin:
-    def __init__(self, proxy=None, timeout=(10.0, 20.0)):
+    def __init__(self, proxy=None, timeout=(10.0, 25.0)):
         self.proxy = proxy
         self.timeout = timeout
 
@@ -135,24 +134,33 @@ class FreeFireLogin:
             "uid": int(uid),
         }
         for attempt in range(4):
-            r = cffi_requests.post(
-                f"{OAUTH_BASE}/api/v2/oauth/guest/token:grant",
-                headers={
-                    "User-Agent": UA_MSDK,
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Connection": "close",
-                },
-                json=body, verify=False, proxies=self.proxy,
-                timeout=self.timeout, impersonate=IMPERSONATE,
-            )
+            try:
+                r = cffi_requests.post(
+                    f"{OAUTH_BASE}/api/v2/oauth/guest/token:grant",
+                    headers={
+                        "User-Agent": UA_MSDK,
+                        "Content-Type": "application/json; charset=utf-8",
+                        "Connection": "close",
+                    },
+                    json=body, verify=False, proxies=self.proxy,
+                    timeout=self.timeout, impersonate=IMPERSONATE,
+                )
+            except Exception as e:
+                if attempt == 3:
+                    raise RuntimeError(f"token_grant_exc_{str(e)[:40]}")
+                time.sleep(2)
+                continue
+
             if r.status_code == 429:
                 time.sleep(min(3 + attempt * 4, 20))
                 continue
+
             if r.status_code == 200:
                 d = (r.json() or {}).get("data") or {}
                 if "access_token" in d and "open_id" in d:
                     return d
                 raise RuntimeError("token_grant_bad_payload")
+
             try:
                 j = r.json()
             except Exception:
@@ -162,6 +170,7 @@ class FreeFireLogin:
             if code == 1002 or "error_params" in str(err).lower():
                 raise RuntimeError("error_params")
             raise RuntimeError(f"token_grant_http_{r.status_code}")
+
         raise RuntimeError("token_grant_429_after_retries")
 
     def _major_login(self, access_token, open_id):
@@ -173,31 +182,41 @@ class FreeFireLogin:
         body = enc_aes(blackboxprotobuf.encode_message(meta, TYPEDEF_LOGIN))
 
         for attempt in range(3):
-            r = cffi_requests.post(
-                f"{LOGIN_BASE}/MajorLogin",
-                headers={
-                    "Host": "loginbp.ppmainecoonghj.com",
-                    "User-Agent": UA_UNITY,
-                    "Accept": "*/*",
-                    "Accept-Encoding": "deflate, gzip",
-                    "Authorization": "Bearer",
-                    "X-GA": "v1 1",
-                    "ReleaseVersion": "OB55",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "X-Unity-Version": "2018.4.12f1",
-                    "X-GA-SV": str(int(time.time())),
-                },
-                data=body, verify=False, proxies=self.proxy,
-                timeout=self.timeout, impersonate=IMPERSONATE,
-            )
+            try:
+                r = cffi_requests.post(
+                    f"{LOGIN_BASE}/MajorLogin",
+                    headers={
+                        "Host": "loginbp.ppmainecoonghj.com",
+                        "User-Agent": UA_UNITY,
+                        "Accept": "*/*",
+                        "Accept-Encoding": "deflate, gzip",
+                        "Authorization": "Bearer",
+                        "X-GA": "v1 1",
+                        "ReleaseVersion": "OB55",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "X-Unity-Version": "2018.4.12f1",
+                        "X-GA-SV": str(int(time.time())),
+                    },
+                    data=body, verify=False, proxies=self.proxy,
+                    timeout=self.timeout, impersonate=IMPERSONATE,
+                )
+            except Exception as e:
+                if attempt == 2:
+                    raise RuntimeError(f"majorlogin_exc_{str(e)[:40]}")
+                time.sleep(2)
+                continue
+
             if r.status_code == 429:
                 time.sleep(min(3 + attempt * 4, 15))
                 continue
+
             if r.status_code == 200:
                 return self._parse(r.content)
+
             if "INVALID_PLATFORM" in r.text:
                 raise RuntimeError("invalid_platform")
             raise RuntimeError(f"majorlogin_http_{r.status_code}")
+
         raise RuntimeError("majorlogin_429_after_retries")
 
     @staticmethod
