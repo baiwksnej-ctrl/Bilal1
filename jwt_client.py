@@ -1,6 +1,5 @@
 # ============================================================
-# jwt_client.py - Free Fire login engine v2
-# مع معالجة 429 + ggpolarbear
+# jwt_client.py - with curl_cffi TLS impersonation
 # ============================================================
 import base64
 import json
@@ -9,13 +8,10 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-import requests
-import urllib3
+from curl_cffi import requests as cffi_requests
 import blackboxprotobuf
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 AES_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 AES_IV  = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
@@ -84,15 +80,18 @@ LOGIN_META = {
 }
 
 OAUTH_BASE = "https://ffmconnect.live.gop.garenanow.com"
-LOGIN_BASE = "https://loginbp.ggpolarbear.com"
+LOGIN_BASE = "https://loginbp.ppmainecoonghj.com"
 CLIENT_ID = 100067
 CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
 UA_MSDK = "GarenaMSDK/4.0.44(ASUS_AI2501_B ;Android 12;en;US;app 2.132.1 2019118525;)"
 UA_UNITY = "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"
 
+# impersonate profile - mimics a real browser's TLS fingerprint
+IMPERSONATE = "chrome120"
+
 
 class FreeFireLogin:
-    def __init__(self, proxy=None, timeout=(5.0, 12.0)):
+    def __init__(self, proxy=None, timeout=(10.0, 20.0)):
         self.proxy = proxy
         self.timeout = timeout
 
@@ -135,31 +134,25 @@ class FreeFireLogin:
             "response_type": "token",
             "uid": int(uid),
         }
-
-        # محاولات متعددة عند 429
         for attempt in range(4):
-            r = requests.post(
+            r = cffi_requests.post(
                 f"{OAUTH_BASE}/api/v2/oauth/guest/token:grant",
                 headers={
                     "User-Agent": UA_MSDK,
                     "Content-Type": "application/json; charset=utf-8",
                     "Connection": "close",
                 },
-                json=body, verify=False, proxies=self.proxy, timeout=self.timeout,
+                json=body, verify=False, proxies=self.proxy,
+                timeout=self.timeout, impersonate=IMPERSONATE,
             )
-
             if r.status_code == 429:
-                wait = min(3 + attempt * 4, 20)
-                time.sleep(wait)
+                time.sleep(min(3 + attempt * 4, 20))
                 continue
-
             if r.status_code == 200:
                 d = (r.json() or {}).get("data") or {}
                 if "access_token" in d and "open_id" in d:
                     return d
                 raise RuntimeError("token_grant_bad_payload")
-
-            # other statuses
             try:
                 j = r.json()
             except Exception:
@@ -169,7 +162,6 @@ class FreeFireLogin:
             if code == 1002 or "error_params" in str(err).lower():
                 raise RuntimeError("error_params")
             raise RuntimeError(f"token_grant_http_{r.status_code}")
-
         raise RuntimeError("token_grant_429_after_retries")
 
     def _major_login(self, access_token, open_id):
@@ -178,14 +170,13 @@ class FreeFireLogin:
         meta["19"] = f"Google|{uuid.uuid4()}".encode()
         meta["22"] = open_id.encode()
         meta["29"] = access_token.encode()
-
         body = enc_aes(blackboxprotobuf.encode_message(meta, TYPEDEF_LOGIN))
 
         for attempt in range(3):
-            r = requests.post(
+            r = cffi_requests.post(
                 f"{LOGIN_BASE}/MajorLogin",
                 headers={
-                    "Host": "loginbp.ggpolarbear.com",
+                    "Host": "loginbp.ppmainecoonghj.com",
                     "User-Agent": UA_UNITY,
                     "Accept": "*/*",
                     "Accept-Encoding": "deflate, gzip",
@@ -196,20 +187,17 @@ class FreeFireLogin:
                     "X-Unity-Version": "2018.4.12f1",
                     "X-GA-SV": str(int(time.time())),
                 },
-                data=body, verify=False, proxies=self.proxy, timeout=self.timeout,
+                data=body, verify=False, proxies=self.proxy,
+                timeout=self.timeout, impersonate=IMPERSONATE,
             )
-
             if r.status_code == 429:
                 time.sleep(min(3 + attempt * 4, 15))
                 continue
-
             if r.status_code == 200:
                 return self._parse(r.content)
-
             if "INVALID_PLATFORM" in r.text:
                 raise RuntimeError("invalid_platform")
             raise RuntimeError(f"majorlogin_http_{r.status_code}")
-
         raise RuntimeError("majorlogin_429_after_retries")
 
     @staticmethod
@@ -244,18 +232,14 @@ class FreeFireLogin:
                         elif ks in ("9", "10", "11") and isinstance(v, bytes):
                             extra[{"9": "ttl", "10": "server_url",
                                    "11": "new_active_region"}[ks]] = v.decode("utf-8", "ignore")
-
                     if extra.get("jwt"):
                         return extra.pop("jwt"), extra
-
                     v2 = obj.get("2", obj.get(b"2"))
                     if isinstance(v2, bytes) and v2.startswith(b"eyJ"):
                         return v2.decode("utf-8", "ignore"), extra
             except Exception:
                 pass
-
             m = re.search(rb"eyJ[\w\-]+\.[\w\-]+\.[\w\-]+", blob)
             if m:
                 return m.group(0).decode(), {}
-
         return None, {}
