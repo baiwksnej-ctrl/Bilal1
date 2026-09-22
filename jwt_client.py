@@ -83,7 +83,7 @@ LOGIN_META = {
 }
 
 OAUTH_BASE = "https://ffmconnect.live.gop.garenanow.com"
-LOGIN_BASE = "https://loginbp.ppmainecoonghj.com"
+LOGIN_BASE = "https://loginbp.ggpolarbear.com"
 CLIENT_ID = 100067
 CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
 UA_MSDK = "GarenaMSDK/4.0.44(ASUS_AI2501_B ;Android 12;en;US;app 2.132.1 2019118525;)"
@@ -170,7 +170,7 @@ class FreeFireLogin:
         r = requests.post(
             f"{LOGIN_BASE}/MajorLogin",
             headers={
-                "Host": "loginbp.ppmainecoonghj.com",
+                "Host": "loginbp.ggpolarbear.com",
                 "User-Agent": UA_UNITY,
                 "Accept": "*/*",
                 "Accept-Encoding": "deflate, gzip",

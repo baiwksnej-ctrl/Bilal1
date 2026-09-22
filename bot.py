@@ -49,7 +49,7 @@ WORKERS = int(os.environ.get("LIKE_WORKERS", "5"))
 RESUME = os.environ.get("RESUME", "1") == "1"
 PROGRESS_EVERY_SEC = 6
 
-LIKE_URL = "https://clientbp.ppmainecoonghj.com/LikeProfile"
+LIKE_URL = "https://clientbp.ggpolarbear.com/LikeProfile"
 MAX_RETRIES = 3
 BASE_BACKOFF = 1.5
 MAX_BACKOFF = 20.0
@@ -241,7 +241,10 @@ def like_once(engine, uid, password, target_uid, retries=MAX_RETRIES):
                 "Content-Type": "application/x-www-form-urlencoded",
                 "X-Unity-Version": "2018.4.12f1",
             }
-            r = _session().post(LIKE_URL, headers=headers, data=body, timeout=15, verify=False)
+            r = _session().post(
+    LIKE_URL, headers=headers, data=body,
+    timeout=15, verify=False, proxies=None,
+)
 
             if r.status_code == 429:
                 wait = min(BASE_BACKOFF * (2 ** attempt), MAX_BACKOFF)
