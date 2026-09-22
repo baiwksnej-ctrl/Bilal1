@@ -1,5 +1,6 @@
 # ============================================================
-# jwt_client.py - Free Fire login engine (uid+password -> JWT)
+# jwt_client.py - Free Fire login engine v2
+# مع معالجة 429 + ggpolarbear
 # ============================================================
 import base64
 import json
@@ -134,16 +135,31 @@ class FreeFireLogin:
             "response_type": "token",
             "uid": int(uid),
         }
-        r = requests.post(
-            f"{OAUTH_BASE}/api/v2/oauth/guest/token:grant",
-            headers={
-                "User-Agent": UA_MSDK,
-                "Content-Type": "application/json; charset=utf-8",
-                "Connection": "close",
-            },
-            json=body, verify=False, proxies=self.proxy, timeout=self.timeout,
-        )
-        if r.status_code != 200:
+
+        # محاولات متعددة عند 429
+        for attempt in range(4):
+            r = requests.post(
+                f"{OAUTH_BASE}/api/v2/oauth/guest/token:grant",
+                headers={
+                    "User-Agent": UA_MSDK,
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Connection": "close",
+                },
+                json=body, verify=False, proxies=self.proxy, timeout=self.timeout,
+            )
+
+            if r.status_code == 429:
+                wait = min(3 + attempt * 4, 20)
+                time.sleep(wait)
+                continue
+
+            if r.status_code == 200:
+                d = (r.json() or {}).get("data") or {}
+                if "access_token" in d and "open_id" in d:
+                    return d
+                raise RuntimeError("token_grant_bad_payload")
+
+            # other statuses
             try:
                 j = r.json()
             except Exception:
@@ -153,10 +169,8 @@ class FreeFireLogin:
             if code == 1002 or "error_params" in str(err).lower():
                 raise RuntimeError("error_params")
             raise RuntimeError(f"token_grant_http_{r.status_code}")
-        d = (r.json() or {}).get("data") or {}
-        if "access_token" not in d or "open_id" not in d:
-            raise RuntimeError("token_grant_bad_payload")
-        return d
+
+        raise RuntimeError("token_grant_429_after_retries")
 
     def _major_login(self, access_token, open_id):
         meta = dict(LOGIN_META)
@@ -167,27 +181,36 @@ class FreeFireLogin:
 
         body = enc_aes(blackboxprotobuf.encode_message(meta, TYPEDEF_LOGIN))
 
-        r = requests.post(
-            f"{LOGIN_BASE}/MajorLogin",
-            headers={
-                "Host": "loginbp.ggpolarbear.com",
-                "User-Agent": UA_UNITY,
-                "Accept": "*/*",
-                "Accept-Encoding": "deflate, gzip",
-                "Authorization": "Bearer",
-                "X-GA": "v1 1",
-                "ReleaseVersion": "OB55",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "X-Unity-Version": "2018.4.12f1",
-                "X-GA-SV": str(int(time.time())),
-            },
-            data=body, verify=False, proxies=self.proxy, timeout=self.timeout,
-        )
-        if r.status_code != 200:
+        for attempt in range(3):
+            r = requests.post(
+                f"{LOGIN_BASE}/MajorLogin",
+                headers={
+                    "Host": "loginbp.ggpolarbear.com",
+                    "User-Agent": UA_UNITY,
+                    "Accept": "*/*",
+                    "Accept-Encoding": "deflate, gzip",
+                    "Authorization": "Bearer",
+                    "X-GA": "v1 1",
+                    "ReleaseVersion": "OB55",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "X-Unity-Version": "2018.4.12f1",
+                    "X-GA-SV": str(int(time.time())),
+                },
+                data=body, verify=False, proxies=self.proxy, timeout=self.timeout,
+            )
+
+            if r.status_code == 429:
+                time.sleep(min(3 + attempt * 4, 15))
+                continue
+
+            if r.status_code == 200:
+                return self._parse(r.content)
+
             if "INVALID_PLATFORM" in r.text:
                 raise RuntimeError("invalid_platform")
             raise RuntimeError(f"majorlogin_http_{r.status_code}")
-        return self._parse(r.content)
+
+        raise RuntimeError("majorlogin_429_after_retries")
 
     @staticmethod
     def _parse(content):
