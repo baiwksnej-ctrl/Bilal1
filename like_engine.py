@@ -1,6 +1,7 @@
 # ============================================================
 # like_engine.py - LikeProfile sender
 # SERVER: https://clientbp.ppmainecoonghj.com/LikeProfile
+# No blackboxprotobuf — pure protobuf encoding
 # ============================================================
 import os
 import json
@@ -12,7 +13,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import urllib3
-import blackboxprotobuf
 
 from jwt_client import FreeFireLogin, enc_aes, UA_UNITY
 
@@ -20,7 +20,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============ CONFIG ============
 LIKE_URL = "https://clientbp.ppmainecoonghj.com/LikeProfile"
-_LIKE_TYPEDEF = {"1": {"type": "int", "name": ""}}
 
 MAX_RETRIES       = 3
 BASE_BACKOFF      = 1.5
@@ -28,6 +27,31 @@ MAX_BACKOFF       = 20.0
 RATE_LIMIT_PER_MIN = 90
 CHECKPOINT_EVERY   = 25
 PROXY_FILE        = os.environ.get("PROXY_FILE", "proxies.txt")
+
+
+# ============ PROTOBUF HELPERS ============
+def _varint(n):
+    if n < 0:
+        n += 1 << 64
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def build_like_payload(target_uid: int) -> bytes:
+    """
+    Protobuf message for LikeProfile:
+        field 1 (uid) = target_uid (varint)
+    Then AES-CBC encrypt with shared key/IV.
+    """
+    raw = _varint((1 << 3) | 0) + _varint(int(target_uid))
+    return enc_aes(raw)
 
 
 # ============ PROXY POOL ============
@@ -124,12 +148,6 @@ def _session():
         s.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4))
         _tls.s = s
     return _tls.s
-
-
-# ============ PAYLOAD ============
-def build_like_payload(target_uid: int) -> bytes:
-    raw = blackboxprotobuf.encode_message({"1": int(target_uid)}, _LIKE_TYPEDEF)
-    return enc_aes(raw)
 
 
 # ============ SEND ONE LIKE ============
