@@ -1,13 +1,7 @@
 # ============================================================
-# bot.py - FF Like Bot v12 (final, stable)
+# bot.py - Free Fire Bot (Telegram + Flask + Activator + Likes)
+# Full pipeline: Generate → Activate → Like
 # ============================================================
-# - python-telegram-bot 21.6
-# - curl_cffi (impersonate chrome120)
-# - Flask healthcheck
-# - Python 3.11 / 3.14 compatible
-# - all buttons work (allowed_updates = ALL_TYPES)
-# ============================================================
-
 import asyncio
 import hashlib
 import json
@@ -20,14 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import urllib3
-import blackboxprotobuf
-from curl_cffi import requests as cffi_requests
 from flask import Flask, jsonify
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -38,41 +26,34 @@ from telegram.ext import (
 )
 
 from jwt_client import FreeFireLogin, enc_aes, UA_UNITY
+from like_engine import run_like_batch, get_proxy_count
+from activator_engine import activate_batch, PB2_AVAILABLE
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ============================================================
-# CONFIG
-# ============================================================
+# ============ CONFIG ============
 BOT_TOKEN = os.environ.get("TG_TOKEN", "8776921304:AAE75XN-ZOXlBzbaikhxBOW9KQcPki2LREU")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7373420615"))
 ACCOUNTS_FILE = os.environ.get("ACCOUNTS_FILE", "accounts.json")
 TARGET_FILE = os.environ.get("TARGET_FILE", "target.json")
 PORT = int(os.environ.get("PORT", 8080))
-WORKERS = int(os.environ.get("LIKE_WORKERS", "5"))
+WORKERS = int(os.environ.get("LIKE_WORKERS", "3"))
+ACT_CONCURRENT = int(os.environ.get("ACT_CONCURRENT", "20"))
 RESUME = os.environ.get("RESUME", "1") == "1"
 PROGRESS_EVERY_SEC = 6
 
-LIKE_URL = "https://clientbp.ppmainecoonghj.com/LikeProfile"
-MAX_RETRIES = 3
-BASE_BACKOFF = 1.5
-MAX_BACKOFF = 20.0
-RATE_LIMIT_PER_MIN = 90
-CHECKPOINT_EVERY = 25
-IMPERSONATE = "chrome120"
-
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-log = logging.getLogger("ff_like")
+log = logging.getLogger("ff_bot")
 
-# ============================================================
-# STATE
-# ============================================================
+# ============ STATE ============
 is_running = False
+is_activating = False
 active_chat_id = None
 current_target_uid = None
 live_progress_msg_id = None
 waiting_for_uid_input = False
 stats = {"done": 0, "ok": 0, "fail": 0, "total": 0, "start_time": 0.0, "error_breakdown": {}}
+act_stats = {"done": 0, "ok": 0, "fail": 0, "total": 0, "start_time": 0.0}
 STOP_FLAG = {"stop": False}
 LOG_LINES = []
 LOG_LOCK = threading.Lock()
@@ -96,9 +77,7 @@ def is_admin(uid):
         return False
 
 
-# ============================================================
-# TARGET UID (persisted)
-# ============================================================
+# ============ TARGET ============
 def load_target():
     global current_target_uid
     try:
@@ -122,9 +101,7 @@ def save_target(uid):
 load_target()
 
 
-# ============================================================
-# ACCOUNTS
-# ============================================================
+# ============ ACCOUNTS ============
 def load_accounts(force=False):
     now = time.time()
     if not force and _ACCOUNTS_CACHE["list"] and (now - _ACCOUNTS_CACHE["loaded_at"]) < 60:
@@ -152,200 +129,36 @@ def load_accounts(force=False):
     return out
 
 
-# ============================================================
-# RATE LIMITER + GLOBAL BACKOFF
-# ============================================================
-class RateLimiter:
-    def __init__(self, per_minute):
-        self.capacity = per_minute
-        self.tokens = float(per_minute)
-        self.refill = per_minute / 60.0
-        self.last = time.time()
-        self.lock = threading.Lock()
-
-    def acquire(self):
-        with self.lock:
-            now = time.time()
-            self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.refill)
-            self.last = now
-            if self.tokens < 1:
-                time.sleep((1 - self.tokens) / self.refill)
-                self.tokens = 0.0
-            else:
-                self.tokens -= 1.0
-
-
-_rate_limiter = RateLimiter(RATE_LIMIT_PER_MIN)
-
-
-class GlobalBackoff:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.until = 0.0
-
-    def trigger(self, s):
-        with self.lock:
-            self.until = max(self.until, time.time() + s)
-
-    def wait(self):
-        with self.lock:
-            r = self.until - time.time()
-        if r > 0:
-            time.sleep(r)
-
-
-_global_backoff = GlobalBackoff()
-
-
-# ============================================================
-# LIKE LOGIC
-# ============================================================
-def build_payload(target_uid):
-    typedef = {"1": {"type": "int", "name": ""}}
-    raw = blackboxprotobuf.encode_message({"1": int(target_uid)}, typedef)
-    return enc_aes(raw)
-
-
-def like_once(engine, uid, password, target_uid, retries=MAX_RETRIES):
-    last_err = None
-    t0 = time.time()
-    for attempt in range(retries + 1):
-        _rate_limiter.acquire()
-        _global_backoff.wait()
-        try:
-            info = engine.login(uid, password)
-            jwt = info["jwt"]
-            acc_id = info.get("account_id")
-
-            body = build_payload(target_uid)
-            headers = {
-                "Host": "clientbp.ppmainecoonghj.com",
-                "User-Agent": UA_UNITY,
-                "Accept": "*/*",
-                "Accept-Encoding": "deflate, gzip",
-                "X-GA-SV": str(int(time.time())),
-                "Authorization": f"Bearer {jwt}",
-                "X-GA": "v1 1",
-                "ReleaseVersion": "OB55",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "X-Unity-Version": "2018.4.12f1",
-            }
-            r = cffi_requests.post(
-                LIKE_URL, headers=headers, data=body,
-                timeout=20, verify=False, impersonate=IMPERSONATE,
-            )
-
-            if r.status_code == 429:
-                wait = min(BASE_BACKOFF * (2 ** attempt), MAX_BACKOFF)
-                _global_backoff.trigger(wait)
-                last_err = "429"
-                continue
-
-            if r.status_code == 200:
-                return {"uid": uid, "account_id": acc_id, "success": True, "elapsed": time.time() - t0}
-
-            last_err = f"HTTP {r.status_code}"
-        except Exception as e:
-            last_err = str(e)[:80]
-
-        if attempt < retries:
-            time.sleep(min(BASE_BACKOFF * (2 ** attempt), MAX_BACKOFF))
-
-    return {"uid": uid, "success": False, "error": last_err or "unknown", "elapsed": time.time() - t0}
-
-
-def _key(uid):
-    return hashlib.md5(str(uid).encode()).hexdigest()[:12]
-
-
-def _load_ckpt(path):
-    if not path or not os.path.exists(path):
-        return set()
+def save_activation_results(results):
+    """Update accounts.json with activation data."""
     try:
-        with open(path, "r") as f:
-            return set(json.load(f))
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
     except Exception:
-        return set()
+        data = []
 
+    result_map = {r["uid"]: r for r in results if isinstance(r, dict)}
 
-def _save_ckpt(path, keys):
+    for acc in data:
+        if isinstance(acc, dict):
+            info = acc.get("guest_account_info") or acc
+            uid = str(info.get("com.garena.msdk.guest_uid") or info.get("uid") or "")
+            if uid in result_map and result_map[uid].get("status") == "success":
+                r = result_map[uid]
+                acc["activated"] = True
+                acc["account_id"] = r["data"].get("account_id", "")
+                acc["detected_region"] = r["data"].get("detected_region", "")
+                acc["activation_token"] = r["data"].get("token", "")
+                acc["activation_time"] = datetime.utcnow().isoformat()
+
     try:
-        with open(path, "w") as f:
-            json.dump(sorted(keys), f)
-    except Exception:
-        pass
+        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log.error(f"[save_activation] {e}")
 
 
-def run_like_batch(accounts, target_uid, workers, on_progress, stop_flag, resume):
-    if not accounts:
-        return 0, 0, []
-
-    ckpt = f"like_checkpoint_{target_uid}.json"
-    failed_out = f"failed_accounts_{target_uid}.json"
-
-    seen, uniq = set(), []
-    for a in accounts:
-        u = str(a.get("uid"))
-        if u and u not in seen:
-            seen.add(u)
-            uniq.append(a)
-    accounts = uniq
-
-    done_keys = _load_ckpt(ckpt) if resume else set()
-    if done_keys:
-        accounts = [a for a in accounts if _key(a["uid"]) not in done_keys]
-    if not accounts:
-        return 0, 0, []
-
-    engine = FreeFireLogin()
-    ok = fail = 0
-    results = []
-    done = 0
-    total = len(accounts)
-
-    def _w(a):
-        return like_once(engine, a["uid"], a["password"], target_uid)
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_w, a): a for a in accounts}
-        for fut in as_completed(futs):
-            if stop_flag and stop_flag.get("stop"):
-                for f in futs:
-                    f.cancel()
-                break
-            try:
-                res = fut.result()
-            except Exception as e:
-                res = {"uid": "?", "success": False, "error": str(e)[:80]}
-            done += 1
-            results.append(res)
-            if res.get("success"):
-                ok += 1
-                done_keys.add(_key(res["uid"]))
-            else:
-                fail += 1
-            if on_progress:
-                try:
-                    on_progress(done, total, ok, fail, res)
-                except Exception:
-                    pass
-            if done % CHECKPOINT_EVERY == 0:
-                _save_ckpt(ckpt, done_keys)
-
-    _save_ckpt(ckpt, done_keys)
-    failed = [r for r in results if not r.get("success")]
-    if failed:
-        try:
-            with open(failed_out, "w", encoding="utf-8") as f:
-                json.dump(failed, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
-    return ok, fail, results
-
-
-# ============================================================
-# FLASK HEALTHCHECK
-# ============================================================
+# ============ FLASK ============
 def run_flask():
     app = Flask(__name__)
 
@@ -354,11 +167,9 @@ def run_flask():
         return jsonify({
             "status": "ok",
             "running": is_running,
+            "activating": is_activating,
             "target_uid": current_target_uid,
-            "done": stats["done"],
-            "ok": stats["ok"],
-            "fail": stats["fail"],
-            "total": stats["total"],
+            "done": stats["done"], "ok": stats["ok"], "fail": stats["fail"], "total": stats["total"],
         })
 
     @app.route("/health")
@@ -366,7 +177,7 @@ def run_flask():
         return "ok", 200
 
     @app.route("/accounts-count")
-    def accounts_count():
+    def acc():
         return jsonify({"count": len(load_accounts())})
 
     @app.route("/logs")
@@ -378,89 +189,159 @@ def run_flask():
     app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
 
 
-# ============================================================
-# KEYBOARDS
-# ============================================================
+# ============ KEYBOARDS (ENGLISH) ============
 def kb_main():
-    like_txt = "🛑 إيقاف الإعجابات" if is_running else "❤️ إرسال إعجابات"
+    like_txt = "🛑 Stop Likes" if is_running else "❤️ Send Likes"
     like_cb = "like_stop" if is_running else "like_start"
-    keyboard = [
-        [InlineKeyboardButton(like_txt, callback_data=like_cb)],
-        [
-            InlineKeyboardButton("🎯 تعيين UID الهدف", callback_data="set_uid"),
-            InlineKeyboardButton("📊 الحالة", callback_data="status"),
-        ],
-        [
-            InlineKeyboardButton("🔑 اختبار حساب", callback_data="test_acc"),
-            InlineKeyboardButton("♻️ إعادة تحميل", callback_data="reload"),
-        ],
-        [
-            InlineKeyboardButton("📥 تحميل الفاشلة", callback_data="dl_failed"),
-            InlineKeyboardButton("📜 السجل", callback_data="logs"),
-        ],
-        [
-            InlineKeyboardButton("🗑️ مسح السجل", callback_data="clear_logs"),
-            InlineKeyboardButton("🆔 معرّفي", callback_data="myid"),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def kb_back():
+    act_txt = "🔄 Activating..." if is_activating else "⚡ Activate All Accounts"
+    act_cb = "act_running" if is_activating else "act_start"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
+        [InlineKeyboardButton(like_txt, callback_data=like_cb)],
+        [InlineKeyboardButton(act_txt, callback_data=act_cb)],
+        [InlineKeyboardButton("🎯 Set Target UID", callback_data="set_uid"),
+         InlineKeyboardButton("📊 Status", callback_data="status")],
+        [InlineKeyboardButton("🔑 Test Account", callback_data="test_acc"),
+         InlineKeyboardButton("♻️ Reload", callback_data="reload")],
+        [InlineKeyboardButton("📥 Download Failed", callback_data="dl_failed"),
+         InlineKeyboardButton("📜 Logs", callback_data="logs")],
+        [InlineKeyboardButton("🗑️ Clear Logs", callback_data="clear_logs"),
+         InlineKeyboardButton("🆔 My ID", callback_data="myid")],
     ])
 
 
-# ============================================================
-# TEXT
-# ============================================================
+def kb_back():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
+
+
 def main_text():
     acc_n = len(load_accounts())
-    tgt = current_target_uid or "لم يُعيَّن بعد"
-    state = "🟢 يعمل" if is_running else "🔴 متوقف"
+    proxy_n = get_proxy_count()
+    tgt = current_target_uid or "not set"
+    state = "🟢 Running" if is_running else "🔴 Idle"
+    act_state = "🟡 Activating..." if is_activating else "⚪ Idle"
+    pb2_state = "✅" if PB2_AVAILABLE else "❌"
     return (
-        "❤️ *بوت إعجابات Free Fire — v12*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧠 الحالة: {state}\n"
-        f"🎯 الهدف: `{tgt}`\n"
-        f"👥 الحسابات: {acc_n}\n"
-        f"📈 آخر جلسة: {stats['ok']}/{stats['total']}\n"
+        f"❤️ *Free Fire Bot — v1.0*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 Likes: {state}\n"
+        f"⚡ Activation: {act_state}\n"
+        f"🎯 Target UID: `{tgt}`\n"
+        f"👥 Accounts: {acc_n}\n"
+        f"🌐 Proxies: {proxy_n}\n"
+        f"📦 Pb2 Modules: {pb2_state}\n"
+        f"📈 Last Session: {stats['ok']}/{stats['total']}\n"
     )
 
 
-# ============================================================
-# LIKE ASYNC WRAPPER
-# ============================================================
+# ============ ACTIVATION ASYNC ============
+async def run_activation_async(chat_id, context):
+    global is_activating, act_stats
+
+    accounts = load_accounts()
+    if not accounts:
+        await context.bot.send_message(chat_id=chat_id, text="❌ No accounts found")
+        return
+
+    is_activating = True
+    act_stats.update({"done": 0, "ok": 0, "fail": 0, "total": len(accounts), "start_time": time.time()})
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"⚡ *Activation Started*\n👥 {len(accounts)} accounts\n⚙️ Concurrent: {ACT_CONCURRENT}",
+        parse_mode="Markdown",
+    )
+
+    # Prepare minimal accounts for activator
+    act_input = [
+        {"uid": a["uid"], "password": a["password"], "name": f"ACC-{a['uid'][-4:]}", "region": "auto"}
+        for a in accounts
+    ]
+
+    progress_state = {"last": 0.0, "ok": 0, "fail": 0}
+
+    def on_progress(idx, total, result):
+        progress_state["done"] = idx
+        if result.get("status") == "success":
+            progress_state["ok"] += 1
+        else:
+            progress_state["fail"] += 1
+
+        now = time.time()
+        if now - progress_state["last"] < 4 and idx != total:
+            return
+        progress_state["last"] = now
+
+        act_stats["done"] = idx
+        act_stats["ok"] = progress_state["ok"]
+        act_stats["fail"] = progress_state["fail"]
+
+        txt = (
+            f"⚡ *Activating...*\n"
+            f"📦 {idx}/{total}\n"
+            f"✅ {progress_state['ok']}  ❌ {progress_state['fail']}"
+        )
+        asyncio.run_coroutine_threadsafe(
+            context.bot.send_message(chat_id=chat_id, text=txt, parse_mode="Markdown"),
+            asyncio.get_running_loop(),
+        )
+
+    try:
+        results = await activate_batch(act_input, ACT_CONCURRENT, on_progress)
+    except Exception as e:
+        log.error(f"[activation] {e}\n{traceback.format_exc()}")
+        results = []
+
+    # Normalize results (gather returns may include exceptions)
+    valid = []
+    for r in results:
+        if isinstance(r, dict):
+            valid.append(r)
+
+    save_activation_results(valid)
+
+    success = sum(1 for r in valid if r.get("status") == "success")
+    partial = sum(1 for r in valid if r.get("status") == "partial")
+    failed = sum(1 for r in valid if r.get("status") in ("failed", "error"))
+
+    is_activating = False
+
+    summary = (
+        f"🏁 *Activation Complete*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 Total: {len(valid)}\n"
+        f"✅ Success: {success}\n"
+        f"⚠️ Partial: {partial}\n"
+        f"❌ Failed: {failed}\n"
+    )
+    await context.bot.send_message(
+        chat_id=chat_id, text=summary,
+        reply_markup=kb_main(), parse_mode="Markdown",
+    )
+
+
+# ============ LIKE ASYNC ============
 async def run_like_async(chat_id, context):
     global is_running, live_progress_msg_id, stats
 
-    target_uid = current_target_uid
-    if not target_uid:
-        await context.bot.send_message(chat_id=chat_id, text="❌ لم يتم تعيين UID هدف بعد")
+    tgt = current_target_uid
+    if not tgt:
+        await context.bot.send_message(chat_id=chat_id, text="❌ No target UID set")
         return
 
     accounts = load_accounts()
     if not accounts:
-        await context.bot.send_message(chat_id=chat_id, text="❌ لا توجد حسابات في accounts.json")
+        await context.bot.send_message(chat_id=chat_id, text="❌ No accounts found")
         return
 
     is_running = True
     STOP_FLAG["stop"] = False
-    stats.update({
-        "done": 0, "ok": 0, "fail": 0, "total": len(accounts),
-        "start_time": time.time(), "error_breakdown": {},
-    })
+    stats.update({"done": 0, "ok": 0, "fail": 0, "total": len(accounts),
+                  "start_time": time.time(), "error_breakdown": {}})
     live_progress_msg_id = None
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=(
-            f"🚀 *بدء الإرسال*\n"
-            f"🎯 الهدف: `{target_uid}`\n"
-            f"👥 الحسابات: {len(accounts)}\n"
-            f"⚙️ workers: {WORKERS}"
-        ),
+        text=f"🚀 *Likes Started*\n🎯 `{tgt}`\n👥 {len(accounts)} accounts\n⚙️ Workers: {WORKERS}",
         parse_mode="Markdown",
     )
 
@@ -484,21 +365,18 @@ async def run_like_async(chat_id, context):
         mark = "✅" if res.get("success") else "❌"
 
         txt = (
-            f"❤️ *جارٍ الإرسال*\n"
-            f"`{bar}` {pct:.1f}%\n\n"
+            f"❤️ *Sending Likes...*\n`{bar}` {pct:.1f}%\n\n"
             f"📦 {done}/{total}\n"
             f"✅ {ok}   ❌ {fail}\n"
-            f"⚡ {rate:.0f}/دقيقة   ⏱ {el:.0f}s\n"
+            f"⚡ {rate:.0f}/min   ⏱ {el:.0f}s\n"
             f"⏳ ETA: {eta:.0f}s\n"
-            f"آخر: {mark} `…{str(res.get('uid',''))[-6:]}`"
+            f"Last: {mark} `…{str(res.get('uid',''))[-6:]}`"
         )
-        asyncio.run_coroutine_threadsafe(
-            _update_progress(context, chat_id, txt), loop,
-        )
+        asyncio.run_coroutine_threadsafe(_update_progress(context, chat_id, txt), loop)
 
     try:
         ok, fail, results = await asyncio.to_thread(
-            run_like_batch, accounts, target_uid, WORKERS,
+            run_like_batch, accounts, tgt, WORKERS,
             on_progress, STOP_FLAG, RESUME,
         )
     except Exception as e:
@@ -514,17 +392,16 @@ async def run_like_async(chat_id, context):
     stats["error_breakdown"] = breakdown
     is_running = False
 
-    header = "🛑 *تم الإيقاف*" if STOP_FLAG["stop"] else "🏁 *اكتمل الإرسال*"
+    header = "🛑 *Stopped*" if STOP_FLAG["stop"] else "🏁 *Completed*"
     summary = (
-        f"{header}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 الهدف: `{target_uid}`\n"
-        f"✅ نجح: {ok}\n"
-        f"❌ فشل: {fail}\n"
+        f"{header}\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Target: `{tgt}`\n"
+        f"✅ Success: {ok}\n"
+        f"❌ Failed: {fail}\n"
         f"⏱ {el:.0f}s\n"
     )
     if breakdown:
-        summary += "\n*الأخطاء:*\n"
+        summary += "\n*Errors:*\n"
         for err, cnt in sorted(breakdown.items(), key=lambda x: -x[1])[:5]:
             summary += f"  • `{err[:30]}`: {cnt}\n"
 
@@ -550,33 +427,28 @@ async def _update_progress(context, chat_id, txt):
             log.error(f"[progress] {e}")
 
 
-# ============================================================
-# HANDLERS
-# ============================================================
+# ============ HANDLERS ============
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global active_chat_id
     active_chat_id = update.effective_chat.id
     uid = update.effective_user.id
     if not is_admin(uid):
-        await update.message.reply_text(f"🚫 غير مصرح: `{uid}`", parse_mode="Markdown")
+        await update.message.reply_text(f"🚫 Unauthorized: `{uid}`", parse_mode="Markdown")
         return
-    await update.message.reply_text(
-        main_text(), reply_markup=kb_main(), parse_mode="Markdown",
-    )
+    await update.message.reply_text(main_text(), reply_markup=kb_main(), parse_mode="Markdown")
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global waiting_for_uid_input, is_running, active_chat_id
+    global waiting_for_uid_input, is_running, is_activating, active_chat_id
 
     q = update.callback_query
-    await q.answer()  # answer immediately to remove spinner
-
+    await q.answer()
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
     active_chat_id = chat_id
 
     if not is_admin(uid):
-        await q.answer("🚫 غير مصرح", show_alert=True)
+        await q.answer("🚫 Unauthorized", show_alert=True)
         return
 
     data = q.data
@@ -587,50 +459,55 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_uid":
         waiting_for_uid_input = True
         await q.edit_message_text(
-            "🎯 *أرسل UID الحساب الهدف*\n\n"
-            "اكتب UID في المحادثة مباشرة.\n"
-            "مثال: `7895804990`",
+            "🎯 *Send Target UID*\nType the UID in chat.\nExample: `7895804990`",
             reply_markup=kb_back(), parse_mode="Markdown",
         )
 
     elif data == "like_start":
         if is_running:
-            await q.answer("⚠️ قيد التنفيذ", show_alert=True)
-            return
+            await q.answer("⚠️ Already running", show_alert=True); return
         if not current_target_uid:
             await q.edit_message_text(
-                "⚠️ *لم تعيّن UID الهدف بعد*\nاضغط 'تعيين UID الهدف' أولاً.",
+                "⚠️ *No target UID set*",
                 reply_markup=kb_main(), parse_mode="Markdown",
-            )
-            return
+            ); return
         await q.edit_message_text(
-            f"🚀 *بدأ الإرسال*\n🎯 `{current_target_uid}`",
+            f"🚀 *Starting Likes*\n🎯 `{current_target_uid}`",
             reply_markup=kb_main(), parse_mode="Markdown",
         )
         asyncio.create_task(run_like_async(chat_id, context))
 
     elif data == "like_stop":
         STOP_FLAG["stop"] = True
+        await q.edit_message_text("🛑 *Stop requested*", reply_markup=kb_main(), parse_mode="Markdown")
+
+    elif data == "act_start":
+        if is_activating:
+            await q.answer("⚠️ Already activating", show_alert=True); return
         await q.edit_message_text(
-            "🛑 *تم طلب الإيقاف*",
+            "⚡ *Starting Activation...*",
             reply_markup=kb_main(), parse_mode="Markdown",
         )
+        asyncio.create_task(run_activation_async(chat_id, context))
+
+    elif data == "act_running":
+        await q.answer("⚠️ Activation in progress", show_alert=True)
 
     elif data == "status":
         el = time.time() - stats["start_time"] if stats["start_time"] else 0
         txt = (
-            "📊 *الحالة*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🟢 يعمل: `{is_running}`\n"
-            f"🎯 الهدف: `{current_target_uid or '—'}`\n"
-            f"✅ نجح: {stats['ok']}\n"
-            f"❌ فشل: {stats['fail']}\n"
-            f"📦 تم: {stats['done']}/{stats['total']}\n"
+            "📊 *Status*\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"🟢 Likes running: `{is_running}`\n"
+            f"⚡ Activating: `{is_activating}`\n"
+            f"🎯 Target UID: `{current_target_uid or '—'}`\n"
+            f"✅ Success: {stats['ok']}\n"
+            f"❌ Failed: {stats['fail']}\n"
+            f"📦 Done: {stats['done']}/{stats['total']}\n"
         )
         if el:
-            txt += f"⏱ الزمن: {el:.0f}s\n"
+            txt += f"⏱ Elapsed: {el:.0f}s\n"
         if stats["error_breakdown"]:
-            txt += "\n*الأخطاء:*\n"
+            txt += "\n*Errors:*\n"
             for err, cnt in sorted(stats["error_breakdown"].items(), key=lambda x: -x[1])[:5]:
                 txt += f"  • `{err[:30]}`: {cnt}\n"
         await q.edit_message_text(txt, reply_markup=kb_back(), parse_mode="Markdown")
@@ -638,13 +515,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "test_acc":
         accs = load_accounts()
         if not accs:
-            await q.edit_message_text("❌ لا توجد حسابات", reply_markup=kb_main())
-            return
+            await q.edit_message_text("❌ No accounts", reply_markup=kb_main()); return
         sample = accs[0]
-        await q.edit_message_text(
-            f"🔑 *اختبار*\nuid: `{sample['uid']}`",
-            parse_mode="Markdown",
-        )
+        await q.edit_message_text(f"🔑 *Testing*\nuid: `{sample['uid']}`", parse_mode="Markdown")
         try:
             t0 = time.time()
             engine = FreeFireLogin()
@@ -652,25 +525,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dt = time.time() - t0
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"✅ *نجح*\naccount_id: `{res['account_id']}`\n⏱ {dt:.2f}s",
+                text=f"✅ *Success*\naccount_id: `{res['account_id']}`\n⏱ {dt:.2f}s",
                 parse_mode="Markdown",
             )
         except Exception as e:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"❌ فشل: `{str(e)[:80]}`",
+                text=f"❌ Failed: `{str(e)[:80]}`",
                 parse_mode="Markdown",
             )
-        await context.bot.send_message(
-            chat_id=chat_id, text="🔙", reply_markup=kb_main(),
-        )
+        await context.bot.send_message(chat_id=chat_id, text="🔙", reply_markup=kb_main())
 
     elif data == "reload":
         n = len(load_accounts(force=True))
-        await q.edit_message_text(
-            f"♻️ تم تحميل {n} حساب",
-            reply_markup=kb_main(),
-        )
+        await q.edit_message_text(f"♻️ Loaded {n} accounts", reply_markup=kb_main())
 
     elif data == "dl_failed":
         tgt = current_target_uid
@@ -680,15 +548,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 content = f.read()
             await context.bot.send_document(
                 chat_id=chat_id, document=content,
-                filename=fname, caption=f"📥 الفاشلة ({tgt})",
+                filename=fname, caption=f"📥 Failed ({tgt})",
             )
         else:
-            await q.edit_message_text("📭 لا يوجد ملف فاشل", reply_markup=kb_main())
+            await q.edit_message_text("📭 No failed file", reply_markup=kb_main())
 
     elif data == "logs":
         with LOG_LOCK:
             lines = LOG_LINES[-60:]
-        txt = "\n".join(lines) if lines else "📭 لا سجل"
+        txt = "\n".join(lines) if lines else "📭 No logs"
         for i in range(0, len(txt), 3500):
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -700,12 +568,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "clear_logs":
         with LOG_LOCK:
             LOG_LINES.clear()
-        await q.edit_message_text("🗑️ تم المسح", reply_markup=kb_main())
+        await q.edit_message_text("🗑️ Cleared", reply_markup=kb_main())
 
     elif data == "myid":
         bot_u = (await context.bot.get_me()).username
         await q.edit_message_text(
-            f"🆔 معرّفك: `{uid}`\n🤖 @{bot_u}",
+            f"🆔 Your ID: `{uid}`\n🤖 @{bot_u}",
             reply_markup=kb_main(), parse_mode="Markdown",
         )
 
@@ -720,31 +588,25 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if waiting_for_uid_input:
         txt = update.message.text.strip()
         if not txt.isdigit():
-            await update.message.reply_text(
-                "❌ أرسل UID رقمي فقط", reply_markup=kb_main(),
-            )
+            await update.message.reply_text("❌ UID must be numeric", reply_markup=kb_main())
             return
         waiting_for_uid_input = False
         save_target(txt)
         await update.message.reply_text(
-            f"✅ *تم تعيين UID الهدف*\n`{txt}`\n\n"
-            f"اضغط '❤️ إرسال إعجابات' للبدء.",
+            f"✅ *Target UID set*\n`{txt}`\n\nPress '❤️ Send Likes' to start.",
             reply_markup=kb_main(), parse_mode="Markdown",
         )
 
 
-# ============================================================
-# MAIN — manual polling (Python 3.14 compatible)
-# ============================================================
+# ============ MAIN ============
 async def main_async():
-    # Flask in background thread
     threading.Thread(target=run_flask, daemon=True).start()
     log_line(f"[main] Flask on {PORT}")
-
-    log_line("=== FF LIKE BOT v12 START ===")
-    log_line(f"admin={ADMIN_ID} workers={WORKERS} resume={RESUME}")
+    log_line("=== FF BOT START ===")
+    log_line(f"admin={ADMIN_ID} workers={WORKERS} act_concurrent={ACT_CONCURRENT}")
     log_line(f"accounts loaded: {len(load_accounts(force=True))}")
     log_line(f"target={current_target_uid or 'none'}")
+    log_line(f"pb2 available: {PB2_AVAILABLE}")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -752,19 +614,12 @@ async def main_async():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # manual polling (avoids run_polling bug on Python 3.14)
     log_line("Initializing bot...")
     await app.initialize()
     await app.start()
-
-    # IMPORTANT: allowed_updates must include callback_query
-    await app.updater.start_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     log_line("Bot polling started (ALL_TYPES)")
 
-    # keep alive
     try:
         while True:
             await asyncio.sleep(3600)

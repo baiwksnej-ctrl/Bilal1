@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.env
+.env.*
+venv/
+.venv/
+.DS_Store
+like_checkpoint_*.json
+failed_accounts_*.json
+target.json
+activation_results.json
+Pb2/__pycache__/
